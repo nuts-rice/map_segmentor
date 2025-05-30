@@ -9,8 +9,8 @@ use std::sync::Arc;
 use ndarray::{Array, ArrayBase, Axis, IxDyn};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-enum SegmentType {
+mod map_render;
+enum SegmentLabel {
     Building,
     Road,
     Water,
@@ -22,7 +22,7 @@ type BbCoords = (f32, f32, f32, f32);
 
 struct Segment {
     coords: BbCoords,
-    segment_type: Option<SegmentType>,
+    segment_type: Option<SegmentLabel>,
     confidence: f32,
 }
 
@@ -33,7 +33,12 @@ struct Segmentor {
 
 impl Segmentor {
     pub fn new(model_path: &str, threshold: f32) -> Self {
-        let env = Arc::new(Environment::builder().with_name("FastSAM").build().unwrap());
+        let env = Arc::new(
+            Environment::builder()
+                .with_name("sam2.1_large")
+                .build()
+                .unwrap(),
+        );
         let encoder = SessionBuilder::new(&env)
             .unwrap()
             .with_model_from_file(model_path)
@@ -153,6 +158,7 @@ impl Segmentor {
 //use ort::Result;
 pub fn main() -> Result<()> {
     let img_path = "../Screenshot_2025-05-27_16-39-42.png";
-    let mut segmentor = Segmentor::new("../models/sam2.1_large.onnx", 0.5);
+    let mut segmentor = Segmentor::new("./models/sam2.1_large.onnx", 0.5);
+    map_render::run();
     Ok(())
 }
