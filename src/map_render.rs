@@ -169,8 +169,8 @@ fn create_map() -> Result<Map, Box<dyn std::error::Error>> {
         .build()
         .expect("failed to create layer");
     Ok(MapBuilder::default()
-        .with_latlon(39.069067, -108.536016)
-        .with_resolution(50.0)
+        .with_latlon(39.05514242773056, -108.52035286223932)
+        .with_resolution(100.0)
         .with_layer(sat_layer)
         .build())
 }
