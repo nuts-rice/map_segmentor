@@ -89,34 +89,11 @@ impl MapApp {
     }
     */
 }
-/*
-fn default_style() -> VectorTileStyle {
-    serde_json::from_str(include_str!("../data/vt_style.json")).expect("invalid style json")
-}
 
-fn gray_style() -> VectorTileStyle {
-    let style_str = r##"
-{
-  "rules": [
-  ],
-  "background": "#ffffffff",
-  "default_symbol": {
-    "line": {
-      "stroke_color": "#000000ff",
-      "width": 0.5
-    },
-    "polygon": {
-      "fill_color": "#999999ff"
-    }
-  }
-}"##;
-    serde_json::from_str(style_str).expect("invalid style json")
-}
-
-*/
 pub fn run() {
-    galileo_egui::init(create_map().expect("Failed to build map"), [])
-        .expect("failed to initialize");
+    galileo_egui::InitBuilder::new(create_map())
+        .init()
+        .expect("Failed to init map");
 }
 
 pub fn download_sat_tile() -> Arc<RwLock<RasterTileLayer>> {
@@ -160,17 +137,18 @@ pub fn download_sat_tile() -> Arc<RwLock<RasterTileLayer>> {
     layer
 }
 
-fn create_map() -> Result<Map, Box<dyn std::error::Error>> {
+fn create_map() -> Map {
     let sat_layer = download_sat_tile();
     let sat_layer_clone = sat_layer.clone();
 
-    let raster_layer = RasterTileLayerBuilder::new_osm()
-        .with_file_cache_checked(".tile_cache")
-        .build()
-        .expect("failed to create layer");
-    Ok(MapBuilder::default()
+    /*    let raster_layer = RasterTileLayerBuilder::new_osm()
+            .with_file_cache_checked(".tile_cache")
+            .build()
+            .expect("failed to create layer");
+    */
+    MapBuilder::default()
         .with_latlon(39.05514242773056, -108.52035286223932)
         .with_resolution(100.0)
         .with_layer(sat_layer)
-        .build())
+        .build()
 }

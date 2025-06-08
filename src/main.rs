@@ -12,6 +12,8 @@ use ndarray::{Array, ArrayBase, ArrayD, Axis, IxDyn};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 mod map_render;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentLabel {
     Building,
     Road,
@@ -28,6 +30,7 @@ struct BbCoords {
     y2: f32,
 }
 
+#[derive(Debug, Clone)]
 struct Segment {
     coords: BbCoords,
     segment_type: Option<SegmentLabel>,
@@ -322,7 +325,9 @@ impl Segmentor {
 pub async fn main() -> Result<()> {
     let img_path = "../Screenshot_2025-05-27_16-39-42.png";
     let mut segmentor = Segmentor::new("./models/sam2.1_large.onnx", 0.5);
-    let _ = segmentor.encode_image(img_path).await;
+    //let _ = segmentor.encode_image(img_path).await;
+    //let (mask_overlay, segments) = segmentor.segment_image(img_path).await?;
+    //println!("Segments: {:?}", segments);
     map_render::run();
     Ok(())
 }
