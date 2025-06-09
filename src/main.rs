@@ -12,7 +12,9 @@ use ndarray::{Array, ArrayBase, ArrayD, Axis, IxDyn};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 mod map_render;
-
+//TODO: consult https://github.com/jamjamjon/usls/blob/main/examples/yolo-sam2/main.rs see if usls
+//and yolo
+//would work
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentLabel {
     Building,
@@ -212,6 +214,29 @@ impl Segmentor {
         }
     }
 
+    async fn generate_segmented_img(
+        &mut self,
+        input_img_path: &str,
+        //output_img_path: &str
+    ) -> Result<RgbaImage> {
+        let img = image::open(input_img_path)?;
+        let (img_w, img_h) = img.dimensions();
+
+        let embeddings = self
+            .encode_image(input_img_path)
+            .await
+            .ok_or("Failed to encode image")?;
+        let embeddings = embeddings.0;
+        let segments = self
+            .generate_segments(img_w as f32, img_h as f32, &embeddings)
+            .await?;
+        let mut output_img = RgbaImage::new(img_w, img_h);
+
+        self.create_mask_overlay(&mut output_img, &segments);
+        //output_img.save(output_img_path)?;
+        Ok(output_img)
+    }
+
     //TODO
     async fn generate_segments(
         &mut self,
@@ -323,8 +348,19 @@ impl Segmentor {
 //use ort::Result;
 #[tokio::main]
 pub async fn main() -> Result<()> {
-    let img_path = "../Screenshot_2025-05-27_16-39-42.png";
+    let img_path = "./Screenshot_2025-05-27_16-39-42.png";
     let mut segmentor = Segmentor::new("./models/sam2.1_large.onnx", 0.5);
+    let timestamp = chrono::Utc::now();
+    let run_dir_path = "./runs/sam2.1_large";
+    //let output_path = format!("{}/output{}.png", run_dir_path, timestamp);
+    //TODO: Fix encoding error
+    segmentor
+        .generate_segmented_img(
+            img_path,
+            //&output_path
+        )
+        .await?;
+
     //let _ = segmentor.encode_image(img_path).await;
     //let (mask_overlay, segments) = segmentor.segment_image(img_path).await?;
     //println!("Segments: {:?}", segments);
