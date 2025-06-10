@@ -62,7 +62,6 @@ impl BbCoords {
 struct Segmentor {
     encoder: Session,
     decoder: Session,
-    embeddings: Mutex<Array<f32, IxDyn>>,
     threshold: f32,
 }
 
@@ -82,12 +81,10 @@ impl Segmentor {
             .unwrap()
             .with_model_from_file(model_path)
             .unwrap();
-        let embeddings = Mutex::new(ArrayBase::zeros((1, 256, 64, 64)).into_dyn());
 
         Self {
             encoder,
             decoder,
-            embeddings,
             threshold,
         }
     }
@@ -129,15 +126,30 @@ impl Segmentor {
         ];
         for segment in segments {
             let color_idx = match segment.segment_type {
-                Some(SegmentLabel::Building) => 0,
-                Some(SegmentLabel::Road) => 1,
-                Some(SegmentLabel::Water) => 2,
-                Some(SegmentLabel::Vegetation) => 3,
-                Some(SegmentLabel::Other) | None => 4,
+                Some(SegmentLabel::Building) => colors[0],
+                Some(SegmentLabel::Road) => colors[1],
+                Some(SegmentLabel::Water) => colors[2],
+                Some(SegmentLabel::Vegetation) => colors[3],
+                Some(SegmentLabel::Other) | None => colors[4],
             };
+            self.apply_mask_to_image(&mut overlay, &segment.mask, color_idx);
         }
 
         overlay
+    }
+
+    fn apply_mask_to_image(&self, img: &mut RgbaImage, mask: &ArrayD<u8>, color: Rgba<u8>) {
+        let (width, height) = (img.width() as usize, img.height() as usize);
+        let mask_view = mask.view().into_dyn();
+
+        for (y, row) in mask_view.axis_iter(Axis(0)).enumerate() {
+            for (x, &value) in row.iter().enumerate() {
+                if value > 0 && x < width && y < height {
+                    let pixel = img.get_pixel_mut(x as u32, y as u32);
+                    pixel.blend(&color);
+                }
+            }
+        }
     }
 
     async fn generate_mask_for_point(
@@ -146,30 +158,25 @@ impl Segmentor {
         y: f32,
         img_w: f32,
         img_h: f32,
+        embeddings: &Array<f32, IxDyn>,
     ) -> Result<Array<u8, IxDyn>> {
-        let embeddings = self.embeddings.lock().unwrap();
-        let embeddings_as_values = embeddings.as_standard_layout();
         let decoder = &self.decoder;
         // Prepare point input (normalized coordinates)
         let point_input = Array::from_shape_vec((1, 1, 2), vec![x / img_w, y / img_h])
             .unwrap()
             .into_dyn();
         let points_as_values = point_input.as_standard_layout();
-        let point_labels = Array::from_shape_vec((1, 2), vec![2.0_f32, 3.0_f32])
-            .unwrap()
-            .into_dyn()
-            .into_owned();
-        let point_labels_as_values = &point_labels.as_standard_layout();
-        let point_tensor = Value::from_array(self.decoder.allocator(), &points_as_values).unwrap();
-        let embeddings_tensor =
-            Value::from_array(self.decoder.allocator(), &embeddings_as_values).unwrap();
-        let outputs = decoder
-            .run(vec![
-                embeddings_tensor,
-                point_tensor,
-                Value::from_array(self.decoder.allocator(), &point_labels_as_values).unwrap(),
-            ])
-            .unwrap();
+        let point_labels = Array::from_shape_vec((1, 2), vec![1.0]).unwrap().into_dyn();
+
+        let point_labels = point_labels.as_standard_layout();
+        let embeddings = embeddings.as_standard_layout();
+
+        let inputs = vec![
+            Value::from_array(decoder.allocator(), &embeddings)?,
+            Value::from_array(decoder.allocator(), &points_as_values)?,
+            Value::from_array(decoder.allocator(), &point_labels)?,
+        ];
+        let outputs = decoder.run(inputs).unwrap();
         let output = outputs
             .get(0)
             .unwrap()
@@ -256,7 +263,7 @@ impl Segmentor {
         }
         for (x, y) in points {
             let mask = self
-                .generate_mask_for_point(x, y, img_w, img_h)
+                .generate_mask_for_point(x, y, img_w, img_h, embeddings)
                 .await
                 .unwrap();
 
