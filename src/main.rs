@@ -1,11 +1,12 @@
 use image::GenericImageView;
 use image::imageops::FilterType;
 use image::{Pixel, Rgba, RgbaImage};
-use ort::Environment;
-use ort::SessionBuilder;
-use ort::Value;
-
+use ort::environment::Environment;
 use ort::session::Session;
+use ort::session::SessionOutputs;
+use ort::session::builder::SessionBuilder;
+use ort::value::Tensor;
+use ort::value::Value;
 use std::sync::{Arc, Mutex};
 
 use ndarray::{Array, ArrayBase, ArrayD, Axis, IxDyn};
@@ -59,6 +60,8 @@ impl BbCoords {
     }
 }
 
+const YOLOV8M_URL: &str = "https://cdn.pyke.io/0/pyke:ort-rs/example-models@0.0.0/yolov8m.onnx";
+
 struct Segmentor {
     encoder: Session,
     decoder: Session,
@@ -67,19 +70,14 @@ struct Segmentor {
 
 impl Segmentor {
     pub fn new(model_path: &str, threshold: f32) -> Self {
-        let env = Arc::new(
-            Environment::builder()
-                .with_name("sam2.1_large")
-                .build()
-                .unwrap(),
-        );
-        let encoder = SessionBuilder::new(&env)
+        let env = Arc::new(ort::init().with_name("sam2.1_large").commit().unwrap());
+        let encoder = Session::builder()
             .unwrap()
-            .with_model_from_file(model_path)
+            .commit_from_url(YOLOV8M_URL)
             .unwrap();
-        let decoder = SessionBuilder::new(&env)
+        let decoder = Session::builder()
             .unwrap()
-            .with_model_from_file(model_path)
+            .commit_from_url(YOLOV8M_URL)
             .unwrap();
 
         Self {
@@ -95,15 +93,20 @@ impl Segmentor {
     }
 
     pub async fn segment_image(&mut self, image_path: &str) -> Result<(RgbaImage, Vec<Segment>)> {
-        let (embeddings, img_w, img_h) = self
-            .encode_image(image_path)
-            .await
-            .ok_or("Failed to encode image")
-            .unwrap();
+        let embeddings = self.encode_image(image_path).unwrap();
+        let (img_w, img_h) = {
+            let img = image::open(image_path)?;
+            img.dimensions()
+        };
         let img = image::open(image_path)?.to_rgba8();
-        let mut segments = self.generate_segments(img_w, img_h, &embeddings).await?;
+        let embeddings_input = embeddings.0;
+        let (resized_w, resized_h) = (embeddings.1, embeddings.2);
+        let mut segments = self
+            .generate_segments(&embeddings_input, resized_w, resized_h)
+            .await?;
         self.classify_segments(&mut segments).await?;
         let mask_overlay = self.create_mask_overlay(&img, &segments);
+
         Ok((mask_overlay, segments))
     }
 
@@ -153,35 +156,31 @@ impl Segmentor {
     }
 
     async fn generate_mask_for_point(
-        &self,
+        &mut self,
         x: f32,
         y: f32,
         img_w: f32,
         img_h: f32,
         embeddings: &Array<f32, IxDyn>,
     ) -> Result<Array<u8, IxDyn>> {
-        let decoder = &self.decoder;
         // Prepare point input (normalized coordinates)
-        let point_input = Array::from_shape_vec((1, 1, 2), vec![x / img_w, y / img_h])
-            .unwrap()
-            .into_dyn();
+        let point_input = Array::from_shape_vec((1, 1, 2), vec![x / img_w, y / img_h])?.into_dyn();
         let points_as_values = point_input.as_standard_layout();
-        let point_labels = Array::from_shape_vec((1, 2), vec![1.0]).unwrap().into_dyn();
+        let point_labels = Array::from_shape_vec((1, 1), vec![1.0]).unwrap().into_dyn();
 
         let point_labels = point_labels.as_standard_layout();
         let embeddings = embeddings.as_standard_layout();
-
-        let inputs = vec![
-            Value::from_array(decoder.allocator(), &embeddings)?,
-            Value::from_array(decoder.allocator(), &points_as_values)?,
-            Value::from_array(decoder.allocator(), &point_labels)?,
+        let inputs = ort::inputs![
+            //ort::value::TensorRef::from_array_view(&point_input).unwrap(),
+            //ort::value::TensorRef::from_array_view(&point_labels).unwrap(),
+            ort::value::TensorRef::from_array_view(&embeddings).unwrap(),
         ];
-        let outputs = decoder.run(inputs).unwrap();
-        let output = outputs
-            .get(0)
+
+        let outputs = self.decoder.run(inputs).unwrap();
+        let output = outputs[0]
+            .try_extract_array::<f32>()
             .unwrap()
-            .try_extract::<f32>()
-            .unwrap()
+            // Run YOLOv8 inference
             .view()
             .t()
             .reversed_axes()
@@ -229,15 +228,14 @@ impl Segmentor {
         let img = image::open(input_img_path)?;
         let (img_w, img_h) = img.dimensions();
 
-        let embeddings = self
-            .encode_image(input_img_path)
-            .await
-            .ok_or("Failed to encode image")?;
+        let (embeddings) = self.encode_image(input_img_path).unwrap();
+        let embeddings = embeddings;
+        let (resized_w, resized_h) = (embeddings.1, embeddings.2);
         let embeddings = embeddings.0;
         let segments = self
-            .generate_segments(img_w as f32, img_h as f32, &embeddings)
+            .generate_segments(&embeddings, resized_w as f32, resized_h as f32)
             .await?;
-        let mut output_img = RgbaImage::new(img_w, img_h);
+        let mut output_img = RgbaImage::new(resized_w as u32, resized_h as u32);
 
         self.create_mask_overlay(&mut output_img, &segments);
         //output_img.save(output_img_path)?;
@@ -247,14 +245,14 @@ impl Segmentor {
     //TODO
     async fn generate_segments(
         &mut self,
-        img_w: f32,
-        img_h: f32,
         embeddings: &Array<f32, IxDyn>,
+        resized_w: f32,
+        resized_h: f32,
     ) -> Result<Vec<Segment>> {
         let mut segments: Vec<Segment> = Vec::new();
         let grid_size = 10;
-        let step_x = img_w / grid_size as f32;
-        let step_y = img_h / grid_size as f32;
+        let step_x = resized_w / grid_size as f32;
+        let step_y = resized_h / grid_size as f32;
         let mut points = Vec::new();
         for i in 0..grid_size {
             for j in 0..grid_size {
@@ -263,11 +261,11 @@ impl Segmentor {
         }
         for (x, y) in points {
             let mask = self
-                .generate_mask_for_point(x, y, img_w, img_h, embeddings)
+                .generate_mask_for_point(x, y, resized_w, resized_h, embeddings)
                 .await
                 .unwrap();
 
-            if let Some(bbox) = self.mask_to_bbox(&mask, img_w, img_h) {
+            if let Some(bbox) = self.mask_to_bbox(&mask, resized_w, resized_h) {
                 let segment = Segment {
                     coords: bbox,
                     segment_type: None,
@@ -284,14 +282,14 @@ impl Segmentor {
     //TODO:
     //SESSION TYPED encoder tx img
 
-    pub async fn encode_image(&mut self, image: &str) -> Option<(Array<f32, IxDyn>, f32, f32)> {
+    fn encode_image(&mut self, image: &str) -> Option<(Array<f32, IxDyn>, f32, f32)> {
         let img = image::open(image).ok()?;
         let (img_w, img_h) = (img.width() as f32, img.height() as f32);
-        let img_resized = img.resize_exact(1024, 1024, FilterType::CatmullRom);
+        let img_resized = img.resize_exact(640, 640, FilterType::CatmullRom);
 
         // Copy the image pixels to the tensor, normalizing them using mean and standard deviations
         // for each color channel
-        let mut input = Array::zeros((1, 3, 1024, 1024)).into_dyn();
+        let mut input = Array::zeros((1, 3, 640, 640));
         let mean = vec![123.675, 116.28, 103.53];
         let std = vec![58.395, 57.12, 57.375];
         for pixel in img_resized.pixels() {
@@ -302,22 +300,32 @@ impl Segmentor {
             input[[0, 1, y, x]] = (g as f32 - mean[1]) / std[1];
             input[[0, 2, y, x]] = (b as f32 - mean[2]) / std[2];
         }
+        //        let input_as_values = &input.as_standard_layout();
+        // let encoder_inputs =
+        //            vec![Value::from_array(self.encoder.allocator(), input_as_values).ok()?];
 
-        let input_as_values = &input.as_standard_layout();
-        let encoder_inputs =
-            vec![Value::from_array(self.encoder.allocator(), input_as_values).ok()?];
-        let encoder_outputs = self.encoder.run(encoder_inputs).ok()?;
-        let embeddings = encoder_outputs
-            .get(0)?
-            .try_extract::<f32>()
+        let outputs: SessionOutputs = self
+            .encoder
+            .run(ort::inputs![
+                ort::value::TensorRef::from_array_view(&input).unwrap()
+            ])
+            .unwrap();
+
+        //let input_as_values = &input.as_standard_layout();
+        //let encoder_inputs = vec![Value::from_array(self.encoder.allocator(), input_as_values).ok()?];
+        //println!("encoder_inputs: {:?}", encoder_inputs);
+        println!("outputs: {:?} ", outputs.len());
+        let embeddings = outputs[0]
+            .try_extract_array::<f32>()
             .ok()?
             .view()
             .t()
             .reversed_axes()
             .into_owned();
-
-        return Some((embeddings, img_w, img_h));
+        println!("embeddings: {:?}", embeddings);
+        return Some((embeddings, img_h, img_w));
     }
+
     fn draw_bounding_box(&self, image: &mut RgbaImage, bbox: BbCoords, color: Rgba<u8>) {
         let (x1, y1, x2, y2) = (
             bbox.x1 as u32,
@@ -355,10 +363,11 @@ impl Segmentor {
 //use ort::Result;
 #[tokio::main]
 pub async fn main() -> Result<()> {
-    let img_path = "./Screenshot_2025-05-27_16-39-42.png";
+    let img_path = "./buildings2.png";
     let mut segmentor = Segmentor::new("./models/sam2.1_large.onnx", 0.5);
     let timestamp = chrono::Utc::now();
     let run_dir_path = "./runs/sam2.1_large";
+    let embeddings = segmentor.encode_image(img_path).unwrap();
     //let output_path = format!("{}/output{}.png", run_dir_path, timestamp);
     //TODO: Fix encoding error
     segmentor
