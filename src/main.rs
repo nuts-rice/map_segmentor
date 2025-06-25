@@ -1,6 +1,8 @@
+use image::GenericImage;
 use image::GenericImageView;
 use image::imageops::FilterType;
 use image::{Pixel, Rgba, RgbaImage};
+use ndarray::{Array, ArrayBase, ArrayD, Axis, IxDyn};
 use ort::environment::Environment;
 use ort::session::Session;
 use ort::session::SessionOutputs;
@@ -8,20 +10,19 @@ use ort::session::builder::SessionBuilder;
 use ort::value::Tensor;
 use ort::value::Value;
 use std::sync::{Arc, Mutex};
-
-use ndarray::{Array, ArrayBase, ArrayD, Axis, IxDyn};
-
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 mod map_render;
 //TODO: consult https://github.com/jamjamjon/usls/blob/main/examples/yolo-sam2/main.rs see if usls
-//and yolo
+//and yolo-obb
 //would work
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentLabel {
     Building,
     Road,
     Water,
+    SwimmingPool,
     Vegetation,
+    TennisCourt,
     Other,
 }
 
@@ -61,28 +62,59 @@ impl BbCoords {
 }
 
 const YOLOV8M_URL: &str = "https://cdn.pyke.io/0/pyke:ort-rs/example-models@0.0.0/yolov8m.onnx";
+const YOLOV11_OBB_PATH: &str = "./models/yolo11n-obb.onnx";
+const YOLOV11_OBB_CLASS_LABELS: [&str; 7] = [
+    "building",
+    "road",
+    "swimming pool",
+    "water",
+    "vegetation",
+    "tennis court",
+    "other",
+];
 
 struct Segmentor {
     encoder: Session,
     decoder: Session,
+
+    img_width: u32,
+    img_height: u32,
+    batch: u32,
+    iou: f32,
+    class_labels: Vec<String>,
+
     threshold: f32,
 }
 
 impl Segmentor {
-    pub fn new(model_path: &str, threshold: f32) -> Self {
-        let env = Arc::new(ort::init().with_name("sam2.1_large").commit().unwrap());
+    pub fn new(
+        model_path: &str,
+        img_width: u32,
+        img_height: u32,
+        batch: u32,
+        iou: f32,
+        class_labels: Vec<String>,
+        threshold: f32,
+    ) -> Self {
         let encoder = Session::builder()
             .unwrap()
-            .commit_from_url(YOLOV8M_URL)
+            .commit_from_file(model_path)
+            //.commit_from_url(YOLOV8M_URL)
             .unwrap();
         let decoder = Session::builder()
             .unwrap()
-            .commit_from_url(YOLOV8M_URL)
+            .commit_from_file(model_path)
+            //.commit_from_url(YOLOV8M_URL)
             .unwrap();
 
         Self {
             encoder,
             decoder,
+            img_height,
+            img_width,
+            batch,
+            iou,
+            class_labels,
             threshold,
         }
     }
@@ -90,24 +122,6 @@ impl Segmentor {
     //TODO
     pub fn process_tile(&mut self) {
         unimplemented!()
-    }
-
-    pub async fn segment_image(&mut self, image_path: &str) -> Result<(RgbaImage, Vec<Segment>)> {
-        let embeddings = self.encode_image(image_path).unwrap();
-        let (img_w, img_h) = {
-            let img = image::open(image_path)?;
-            img.dimensions()
-        };
-        let img = image::open(image_path)?.to_rgba8();
-        let embeddings_input = embeddings.0;
-        let (resized_w, resized_h) = (embeddings.1, embeddings.2);
-        let mut segments = self
-            .generate_segments(&embeddings_input, resized_w, resized_h)
-            .await?;
-        self.classify_segments(&mut segments).await?;
-        let mask_overlay = self.create_mask_overlay(&img, &segments);
-
-        Ok((mask_overlay, segments))
     }
 
     async fn classify_segments(&mut self, segments: &mut [Segment]) -> Result<Vec<Segment>> {
@@ -121,10 +135,12 @@ impl Segmentor {
     fn create_mask_overlay(&self, img: &RgbaImage, segments: &[Segment]) -> RgbaImage {
         let mut overlay = img.clone();
         let colors = [
-            Rgba([255, 0, 0, 128]),     // Red - Buildings
-            Rgba([0, 0, 255, 128]),     // Blue - Roads
+            Rgba([255, 0, 0, 128]), // Red - Buildings
+            Rgba([0, 0, 255, 128]), // Blue - Roads
+            Rgba([0, 255, 255, 128]),
             Rgba([0, 255, 255, 128]),   // Cyan - Water
             Rgba([0, 255, 0, 128]),     // Green - Vegetation
+            Rgba([255, 255, 0, 128]),   // Yellow - Tennis Court
             Rgba([128, 128, 128, 128]), // Gray - Other
         ];
         for segment in segments {
@@ -132,8 +148,10 @@ impl Segmentor {
                 Some(SegmentLabel::Building) => colors[0],
                 Some(SegmentLabel::Road) => colors[1],
                 Some(SegmentLabel::Water) => colors[2],
-                Some(SegmentLabel::Vegetation) => colors[3],
-                Some(SegmentLabel::Other) | None => colors[4],
+                Some(SegmentLabel::SwimmingPool) => colors[3],
+                Some(SegmentLabel::Vegetation) => colors[4],
+                Some(SegmentLabel::TennisCourt) => colors[5],
+                Some(SegmentLabel::Other) | None => colors[6],
             };
             self.apply_mask_to_image(&mut overlay, &segment.mask, color_idx);
         }
@@ -164,18 +182,18 @@ impl Segmentor {
         embeddings: &Array<f32, IxDyn>,
     ) -> Result<Array<u8, IxDyn>> {
         // Prepare point input (normalized coordinates)
-        let point_input = Array::from_shape_vec((1, 1, 2), vec![x / img_w, y / img_h])?.into_dyn();
-        let points_as_values = point_input.as_standard_layout();
-        let point_labels = Array::from_shape_vec((1, 1), vec![1.0]).unwrap().into_dyn();
-
-        let point_labels = point_labels.as_standard_layout();
-        let embeddings = embeddings.as_standard_layout();
+        let point_input =
+            Array::from_shape_vec((1, 1, 1, 2), vec![x / img_w, y / img_h])?.into_dyn();
+        let point_labels = Array::from_shape_vec((1, 1, 1, 1), vec![1.0])
+            .unwrap()
+            .into_dyn();
+        //let embeddings_tensor = Tensor::from_array(ndarray::Array4::<f32>::from_shape_vec(
+        //))
         let inputs = ort::inputs![
-            //ort::value::TensorRef::from_array_view(&point_input).unwrap(),
-            //ort::value::TensorRef::from_array_view(&point_labels).unwrap(),
-            ort::value::TensorRef::from_array_view(&embeddings).unwrap(),
+            //ort::value::TensorRef::from_array_view(&point_input)?,
+            //ort::value::TensorRef::from_array_view(&point_labels)?,
+            ort::value::TensorRef::from_array_view(embeddings)?,
         ];
-
         let outputs = self.decoder.run(inputs).unwrap();
         let output = outputs[0]
             .try_extract_array::<f32>()
@@ -220,25 +238,84 @@ impl Segmentor {
         }
     }
 
-    async fn generate_segmented_img(
+    async fn detect_obb(
         &mut self,
         input_img_path: &str,
         //output_img_path: &str
     ) -> Result<RgbaImage> {
         let img = image::open(input_img_path)?;
-        let (img_w, img_h) = img.dimensions();
 
         let (embeddings) = self.encode_image(input_img_path).unwrap();
-        let embeddings = embeddings;
-        let (resized_w, resized_h) = (embeddings.1, embeddings.2);
-        let embeddings = embeddings.0;
-        let segments = self
-            .generate_segments(&embeddings, resized_w as f32, resized_h as f32)
-            .await?;
-        let mut output_img = RgbaImage::new(resized_w as u32, resized_h as u32);
+        let (predictions) = &embeddings.0;
+        println!("predictions shape: {:?}", predictions.shape());
+        let mut data: Vec<Segment> =  Vec::new();
+        for (idx, row) in predictions.axis_iter(Axis(0)).enumerate() {
+            let original_width = self.img_width as f32;
+            let original_height = self.img_height as f32;
+            let ratio = (1024. / original_width).min(1024. / original_height);
+            for pred in row.axis_iter(Axis(1)) {
+                let bbox = pred.slice(ndarray::s![0..4]);
 
-        self.create_mask_overlay(&mut output_img, &segments);
-        //output_img.save(output_img_path)?;
+                let class_scores = pred.slice(ndarray::s![4..4 + self.class_labels.len()]);
+                let (id, &confidence) = class_scores
+                    .iter()
+                    .enumerate()
+                    .reduce(|max, x| if x.1 > max.1 { x } else { max })
+                    .unwrap();
+
+                if confidence < self.threshold {
+                    continue;
+                }
+                let cx = bbox[0] / ratio;
+                let cy = bbox[1] / ratio;
+                let w = bbox[2] / ratio;
+                let h = bbox[3] / ratio;
+                let x = cx - w / 2.;
+                let y = cy - h / 2.;
+                let bb = BbCoords {
+                    x1: x.max(0.0).min(original_width),
+                    y1: y.max(0.0).min(original_height),
+                    x2: x + w,
+                    y2: y + h,
+                };
+                let segment = Segment {
+                    coords: bb,
+                    segment_type: self.class_labels.get(id).and_then(|label| {
+                        match label.as_str() {
+                            "building" => Some(SegmentLabel::Building),
+                            "road" => Some(SegmentLabel::Road),
+                            "swimming pool" => Some(SegmentLabel::SwimmingPool),
+                            "water" => Some(SegmentLabel::Water),
+                            "vegetation" => Some(SegmentLabel::Vegetation),
+                            "tennis court" => Some(SegmentLabel::TennisCourt),
+                            _ => None,
+                        }
+                    }),
+
+                    confidence: Some(confidence),
+                    mask: Array::zeros((1, 1, 1024, 1024)).into_dyn(), // Placeholder for mask
+                                                                       //self
+                                                                       //    .generate_mask_for_point(cx, cy, original_width, original_height, &embeddings.0)
+                                                                       //    .await?,
+                };
+                data.push(segment);
+            }
+            println!("Segment {}: {:?}", idx, data);
+            
+        }
+
+
+        let mut output_img = RgbaImage::new(1024, 1024);
+
+        output_img.copy_from(&img, 0, 0).unwrap();
+        output_img = self.letterbox(&output_img.into(), 1024, 1024).0.into();
+        self.create_mask_overlay(&mut output_img, &data);
+
+        /*
+               self.create_mask_overlay(&mut output_img, &segments);
+
+                output_img.save(output_img_path)?;
+        */
         Ok(output_img)
     }
 
@@ -278,6 +355,27 @@ impl Segmentor {
 
         Ok(segments)
     }
+    fn letterbox(
+        &self,
+        img: &image::DynamicImage,
+        width: u32,
+        height: u32,
+    ) -> (image::DynamicImage, f32, f32) {
+        let (w, h) = (img.width() as f32, img.height() as f32);
+        let scale = (width as f32 / w).min(height as f32 / h);
+        let new_w = (w * scale).round() as u32;
+        let new_h = (h * scale).round() as u32;
+
+        let resized = img.resize_exact(new_w, new_h, FilterType::Triangle);
+
+        let pad_left = ((width - new_w) as f32 / 2.0).round() as u32;
+        let pad_top = ((height - new_h) as f32 / 2.0).round() as u32;
+
+        let mut canvas = image::DynamicImage::new_rgb8(width, height);
+        canvas.copy_from(&resized, pad_left, pad_top).unwrap();
+
+        (canvas, pad_left as f32, pad_top as f32)
+    }
 
     //TODO:
     //SESSION TYPED encoder tx img
@@ -285,36 +383,32 @@ impl Segmentor {
     fn encode_image(&mut self, image: &str) -> Option<(Array<f32, IxDyn>, f32, f32)> {
         let img = image::open(image).ok()?;
         let (img_w, img_h) = (img.width() as f32, img.height() as f32);
-        let img_resized = img.resize_exact(640, 640, FilterType::CatmullRom);
+        let (resized, pad_left, pad_top) = self.letterbox(&img, 1024, 1024);
+        let (resized_w, resized_h) = (resized.width() as f32, resized.height() as f32);
 
         // Copy the image pixels to the tensor, normalizing them using mean and standard deviations
         // for each color channel
-        let mut input = Array::zeros((1, 3, 640, 640));
-        let mean = vec![123.675, 116.28, 103.53];
-        let std = vec![58.395, 57.12, 57.375];
-        for pixel in img_resized.pixels() {
-            let x = pixel.0 as usize;
-            let y = pixel.1 as usize;
-            let [r, g, b, _] = pixel.2.0;
-            input[[0, 0, y, x]] = (r as f32 - mean[0]) / std[0];
-            input[[0, 1, y, x]] = (g as f32 - mean[1]) / std[1];
-            input[[0, 2, y, x]] = (b as f32 - mean[2]) / std[2];
+        let mut input = Array::zeros((1, 3, 1024, 1024));
+        for (x, y, rgb) in resized.pixels() {
+            let x = x as usize;
+            let y = y as usize;
+            let [r, g, b, _] = rgb.0;
+            input[[0, 0, y, x]] = r as f32 / 255.0;
+            input[[0, 1, y, x]] = g as f32 / 255.0;
+            input[[0, 2, y, x]] = b as f32 / 255.0;
         }
-        //        let input_as_values = &input.as_standard_layout();
-        // let encoder_inputs =
-        //            vec![Value::from_array(self.encoder.allocator(), input_as_values).ok()?];
-
+        let now = std::time::Instant::now();
         let outputs: SessionOutputs = self
             .encoder
             .run(ort::inputs![
                 ort::value::TensorRef::from_array_view(&input).unwrap()
             ])
             .unwrap();
-
-        //let input_as_values = &input.as_standard_layout();
-        //let encoder_inputs = vec![Value::from_array(self.encoder.allocator(), input_as_values).ok()?];
-        //println!("encoder_inputs: {:?}", encoder_inputs);
-        println!("outputs: {:?} ", outputs.len());
+        println!(
+            "outputs: {:?}, inference time: {:?} ",
+            outputs.len(),
+            now.elapsed()
+        );
         let embeddings = outputs[0]
             .try_extract_array::<f32>()
             .ok()?
@@ -363,23 +457,31 @@ impl Segmentor {
 //use ort::Result;
 #[tokio::main]
 pub async fn main() -> Result<()> {
-    let img_path = "./buildings2.png";
-    let mut segmentor = Segmentor::new("./models/sam2.1_large.onnx", 0.5);
+    let img_path = "./buildings4.png";
+    let img = image::open(img_path)?;
+    let (img_w, img_h) = img.dimensions();
+    let mut segmentor = Segmentor::new(
+        YOLOV11_OBB_PATH,
+        img_w,
+        img_h,
+        1,
+        0.5,
+        YOLOV11_OBB_CLASS_LABELS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        0.5,
+    );
     let timestamp = chrono::Utc::now();
-    let run_dir_path = "./runs/sam2.1_large";
-    let embeddings = segmentor.encode_image(img_path).unwrap();
-    //let output_path = format!("{}/output{}.png", run_dir_path, timestamp);
     //TODO: Fix encoding error
-    segmentor
-        .generate_segmented_img(
+    let output_img = segmentor
+        .detect_obb(
             img_path,
             //&output_path
         )
         .await?;
+    output_img.save(format!("./output/{}output.png", timestamp))?;
 
-    //let _ = segmentor.encode_image(img_path).await;
-    //let (mask_overlay, segments) = segmentor.segment_image(img_path).await?;
-    //println!("Segments: {:?}", segments);
     map_render::run();
     Ok(())
 }

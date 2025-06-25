@@ -96,6 +96,10 @@ pub fn run() {
         .expect("Failed to init map");
 }
 
+pub fn build_obb_layer() -> Arc<RwLock<RasterTileLayer>> {
+    unimplemented!()
+}
+
 pub fn download_sat_tile() -> Arc<RwLock<RasterTileLayer>> {
     let api_key = std::env::var("VT_API_KEY")
         .expect("Set MapTiler API key in VT_API_KEY environment variable");
@@ -137,6 +141,10 @@ pub fn download_sat_tile() -> Arc<RwLock<RasterTileLayer>> {
     layer
 }
 
+fn get_zoom() -> u8 {
+    unimplemented!()
+}
+
 fn create_map() -> Map {
     let sat_layer = download_sat_tile();
     let sat_layer_clone = sat_layer.clone();
@@ -148,7 +156,7 @@ fn create_map() -> Map {
     */
     MapBuilder::default()
         .with_latlon(39.05514242773056, -108.52035286223932)
-        .with_resolution(100.0)
+        .with_resolution(150.0)
         .with_layer(sat_layer)
         .build()
 }
