@@ -17,6 +17,7 @@ use galileo::tile_schema::{TileIndex, TileSchema, VerticalDirection};
 use galileo::{Lod, Map, MapBuilder};
 use galileo_egui::EguiMap;
 use galileo_egui::EguiMapState;
+use crate::Segment;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
@@ -98,6 +99,11 @@ pub fn run() {
 
 pub fn build_obb_layer() -> Arc<RwLock<RasterTileLayer>> {
     unimplemented!()
+}
+
+struct SegmentMask{}
+pub fn overlay_segmented_layer(obb_img: &RgbaImage, segments) -> Arc<RwLock<FeatureLayer<Point2, Segment, SegmentMask, CartesianSpace2d>>> {
+    
 }
 
 pub fn download_sat_tile() -> Arc<RwLock<RasterTileLayer>> {

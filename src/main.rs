@@ -8,7 +8,12 @@ use ort::session::Session;
 use ort::session::SessionOutputs;
 use ort::session::builder::SessionBuilder;
 use ort::value::Tensor;
+use galileo::Color;
+use serde::{Deserialize, Serialize, Deserializer};
 use ort::value::Value;
+use galileo::galileo_types::cartesian::{Point2, Rect};
+use galileo::galileo_types::geometry::{CartesianGeometry2d, Geom, Geometry};
+use galileo::galileo_types::impls::{MultiPolygon, Polygon};
 use std::sync::{Arc, Mutex};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 mod map_render;
@@ -26,17 +31,13 @@ enum SegmentLabel {
     Other,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct BbCoords {
-    x1: f32,
-    y1: f32,
-    x2: f32,
-    y2: f32,
-}
 
 #[derive(Debug, Clone)]
 struct Segment {
-    coords: BbCoords,
+#[serde(deserialize_with = "des_geometry")]
+    pub geometry: MultiPolygon<Point2>,
+    pub color: Option<Color>,
+    pub bbox: Rect,
     segment_type: Option<SegmentLabel>,
     confidence: Option<f32>,
     mask: Array<u8, IxDyn>,
@@ -153,6 +154,8 @@ impl Segmentor {
                 Some(SegmentLabel::TennisCourt) => colors[5],
                 Some(SegmentLabel::Other) | None => colors[6],
             };
+            segment.color = Some(Color::from_rgba(color_idx));
+
             self.apply_mask_to_image(&mut overlay, &segment.mask, color_idx);
         }
 
@@ -208,7 +211,7 @@ impl Segmentor {
         Ok(binary_mask)
     }
 
-    fn mask_to_bbox(&self, mask: &Array<u8, IxDyn>, img_w: f32, img_h: f32) -> Option<BbCoords> {
+    fn mask_to_bbox(&self, mask: &Array<u8, IxDyn>, img_w: f32, img_h: f32) -> Option<Rect> {
         let mut min_x = f32::MAX;
         let mut min_y = f32::MAX;
         let mut max_x = f32::MIN;
@@ -232,7 +235,7 @@ impl Segmentor {
             }
         }
         if has_positive {
-            Some(BbCoords::new(min_x, min_y, max_x, max_y))
+            Some(Rect::new(min_x.into(), min_y.into(), max_x.into(), max_y.into()))
         } else {
             None
         }
@@ -272,14 +275,10 @@ impl Segmentor {
                 let h = bbox[3] / ratio;
                 let x = cx - w / 2.;
                 let y = cy - h / 2.;
-                let bb = BbCoords {
-                    x1: x.max(0.0).min(original_width),
-                    y1: y.max(0.0).min(original_height),
-                    x2: x + w,
-                    y2: y + h,
-                };
+                let bb_rect = Rect::new(x.into(), y.into(), x + w.into(), y + h.into());
                 let segment = Segment {
-                    coords: bb,
+                    bbox: bb_rect,
+                    geometry: MultiPolygon::from(Polygon::from(bb_rect)).into(),
                     segment_type: self.class_labels.get(id).and_then(|label| {
                         match label.as_str() {
                             "building" => Some(SegmentLabel::Building),
@@ -291,18 +290,21 @@ impl Segmentor {
                             _ => None,
                         }
                     }),
+                    color: None,
 
                     confidence: Some(confidence),
                     mask: Array::zeros((1, 1, 1024, 1024)).into_dyn(), // Placeholder for mask
                                                                        //self
                                                                        //    .generate_mask_for_point(cx, cy, original_width, original_height, &embeddings.0)
                                                                        //    .await?,
+                }    
                 };
+
                 data.push(segment);
             }
             println!("Segment {}: {:?}", idx, data);
             
-        }
+        
 
 
         let mut output_img = RgbaImage::new(1024, 1024);
@@ -318,6 +320,7 @@ impl Segmentor {
         */
         Ok(output_img)
     }
+    
 
     //TODO
     async fn generate_segments(
@@ -344,7 +347,9 @@ impl Segmentor {
 
             if let Some(bbox) = self.mask_to_bbox(&mask, resized_w, resized_h) {
                 let segment = Segment {
-                    coords: bbox,
+                    geometry: bbox.into(),
+                    color: Color::random(),
+
                     segment_type: None,
                     confidence: None,
                     mask: mask,
@@ -473,6 +478,7 @@ pub async fn main() -> Result<()> {
         0.5,
     );
     let timestamp = chrono::Utc::now();
+    
     //TODO: Fix encoding error
     let output_img = segmentor
         .detect_obb(
@@ -481,6 +487,8 @@ pub async fn main() -> Result<()> {
         )
         .await?;
     output_img.save(format!("./output/{}output.png", timestamp))?;
+
+
 
     map_render::run();
     Ok(())
