@@ -1,9 +1,12 @@
-use crate::BbCoords;
 use eframe::CreationContext;
 use egui::FontDefinitions;
 use galileo::control::{EventPropagation, MouseButton, UserEvent, UserEventHandler};
 use galileo::galileo_types::cartesian::{Point2, Rect};
 use galileo::galileo_types::geo::Crs;
+use galileo::galileo_types::geometry_type::CartesianSpace2d;
+
+use crate::Segment;
+use crate::model::geometry::SegmentMask;
 use galileo::layer::VectorTileLayer;
 use galileo::layer::feature_layer::{FeatureLayer, FeatureLayerOptions};
 use galileo::layer::raster_tile_layer::RasterTileLayer;
@@ -17,10 +20,8 @@ use galileo::tile_schema::{TileIndex, TileSchema, VerticalDirection};
 use galileo::{Lod, Map, MapBuilder};
 use galileo_egui::EguiMap;
 use galileo_egui::EguiMapState;
-use crate::Segment;
 use parking_lot::RwLock;
 use std::sync::Arc;
-
 const MAPTILER_SAT_URL: &str = "https://api.maptiler.com/tiles/satellite-v2/{z}/{x}/{y}.jpg";
 const ORIGIN: galileo::galileo_types::cartesian::Point2 =
     galileo::galileo_types::cartesian::Point2::new(-20037508.342787, 20037508.342787);
@@ -101,9 +102,11 @@ pub fn build_obb_layer() -> Arc<RwLock<RasterTileLayer>> {
     unimplemented!()
 }
 
-struct SegmentMask{}
-pub fn overlay_segmented_layer(obb_img: &RgbaImage, segments) -> Arc<RwLock<FeatureLayer<Point2, Segment, SegmentMask, CartesianSpace2d>>> {
-    
+pub fn overlay_segmented_layer(
+    obb_img: &image::RgbaImage,
+    segments: &[Segment],
+) -> Arc<RwLock<FeatureLayer<Point2, Segment, SegmentMask, CartesianSpace2d>>> {
+    unimplemented!()
 }
 
 pub fn download_sat_tile() -> Arc<RwLock<RasterTileLayer>> {

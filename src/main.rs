@@ -1,3 +1,7 @@
+use galileo::Color;
+use galileo::galileo_types::cartesian::{Point2, Rect};
+use galileo::galileo_types::geometry::{CartesianGeometry2d, Geom, Geometry};
+use galileo::galileo_types::impls::{MultiPolygon, Polygon};
 use image::GenericImage;
 use image::GenericImageView;
 use image::imageops::FilterType;
@@ -8,59 +12,17 @@ use ort::session::Session;
 use ort::session::SessionOutputs;
 use ort::session::builder::SessionBuilder;
 use ort::value::Tensor;
-use galileo::Color;
-use serde::{Deserialize, Serialize, Deserializer};
 use ort::value::Value;
-use galileo::galileo_types::cartesian::{Point2, Rect};
-use galileo::galileo_types::geometry::{CartesianGeometry2d, Geom, Geometry};
-use galileo::galileo_types::impls::{MultiPolygon, Polygon};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::{Arc, Mutex};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 mod map_render;
 //TODO: consult https://github.com/jamjamjon/usls/blob/main/examples/yolo-sam2/main.rs see if usls
 //and yolo-obb
 //would work
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SegmentLabel {
-    Building,
-    Road,
-    Water,
-    SwimmingPool,
-    Vegetation,
-    TennisCourt,
-    Other,
-}
 
-
-#[derive(Debug, Clone)]
-struct Segment {
-#[serde(deserialize_with = "des_geometry")]
-    pub geometry: MultiPolygon<Point2>,
-    pub color: Option<Color>,
-    pub bbox: Rect,
-    segment_type: Option<SegmentLabel>,
-    confidence: Option<f32>,
-    mask: Array<u8, IxDyn>,
-}
-
-impl BbCoords {
-    fn new(x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
-        Self { x1, y1, x2, y2 }
-    }
-    fn area(&self) -> f32 {
-        (self.x2 - self.x1) * (self.y2 - self.y1)
-    }
-
-    fn intersection(&self, other: &Self) -> f32 {
-        let x_overlap = (self.x2.min(other.x2) - self.x1.max(other.x1)).max(0.0);
-        let y_overlap = (self.y2.min(other.y2) - self.y1.max(other.y1)).max(0.0);
-        x_overlap * y_overlap
-    }
-
-    fn union(&self, other: &Self) -> f32 {
-        self.area() + other.area() - self.intersection(other)
-    }
-}
+pub mod model;
+use model::geometry::{Segment, SegmentLabel, SegmentMask};
 
 const YOLOV8M_URL: &str = "https://cdn.pyke.io/0/pyke:ort-rs/example-models@0.0.0/yolov8m.onnx";
 const YOLOV11_OBB_PATH: &str = "./models/yolo11n-obb.onnx";
@@ -135,45 +97,50 @@ impl Segmentor {
 
     fn create_mask_overlay(&self, img: &RgbaImage, segments: &[Segment]) -> RgbaImage {
         let mut overlay = img.clone();
-        let colors = [
-            Rgba([255, 0, 0, 128]), // Red - Buildings
-            Rgba([0, 0, 255, 128]), // Blue - Roads
-            Rgba([0, 255, 255, 128]),
-            Rgba([0, 255, 255, 128]),   // Cyan - Water
-            Rgba([0, 255, 0, 128]),     // Green - Vegetation
-            Rgba([255, 255, 0, 128]),   // Yellow - Tennis Court
-            Rgba([128, 128, 128, 128]), // Gray - Other
+        let colors: Vec<Color> = vec![
+            Color::rgba(255, 0, 0, 0), // Red - Buildings
+            Color::rgba(0, 0, 255, 0), // Blue - Roads
+            Color::rgba(0, 255, 255, 0),
+            Color::rgba(0, 255, 255, 0),   // Cyan - Water
+            Color::rgba(0, 255, 0, 0),     // Green - Vegetation
+            Color::rgba(255, 255, 0, 0),   // Yellow - Tennis Court
+            Color::rgba(128, 128, 128, 0), // Gray - Other
         ];
         for segment in segments {
-            let color_idx = match segment.segment_type {
-                Some(SegmentLabel::Building) => colors[0],
-                Some(SegmentLabel::Road) => colors[1],
-                Some(SegmentLabel::Water) => colors[2],
-                Some(SegmentLabel::SwimmingPool) => colors[3],
-                Some(SegmentLabel::Vegetation) => colors[4],
-                Some(SegmentLabel::TennisCourt) => colors[5],
-                Some(SegmentLabel::Other) | None => colors[6],
+            let segment_type = segment.segment_type.as_ref().unwrap();
+            let color_idx = match segment_type {
+                (SegmentLabel::Building) => colors[0],
+                (SegmentLabel::Road) => colors[1],
+                (SegmentLabel::Water) => colors[2],
+                (SegmentLabel::SwimmingPool) => colors[3],
+                (SegmentLabel::Vegetation) => colors[4],
+                (SegmentLabel::TennisCourt) => colors[5],
+                (SegmentLabel::Other) => colors[6],
             };
-            segment.color = Some(Color::from_rgba(color_idx));
+            //segment.color = Some(color_idx);
 
-            self.apply_mask_to_image(&mut overlay, &segment.mask, color_idx);
+            //self.apply_mask_to_image(&mut overlay, segment_type, color_idx);
         }
 
         overlay
     }
 
-    fn apply_mask_to_image(&self, img: &mut RgbaImage, mask: &ArrayD<u8>, color: Rgba<u8>) {
+    fn apply_mask_to_image(&self, img: &mut RgbaImage, mask: &SegmentMask, color: Color) {
         let (width, height) = (img.width() as usize, img.height() as usize);
-        let mask_view = mask.view().into_dyn();
 
-        for (y, row) in mask_view.axis_iter(Axis(0)).enumerate() {
-            for (x, &value) in row.iter().enumerate() {
-                if value > 0 && x < width && y < height {
-                    let pixel = img.get_pixel_mut(x as u32, y as u32);
-                    pixel.blend(&color);
+        /*
+         let mask_view = mask.view().into_dyn();
+
+                for (y, row) in mask_view.axis_iter(Axis(0)).enumerate() {
+                    for (x, &value) in row.iter().enumerate() {
+                        if value > 0 && x < width && y < height {
+                            let pixel = img.get_pixel_mut(x as u32, y as u32);
+                            pixel.blend(&color);
+                        }
+
+                    }
                 }
-            }
-        }
+        */
     }
 
     async fn generate_mask_for_point(
@@ -235,7 +202,12 @@ impl Segmentor {
             }
         }
         if has_positive {
-            Some(Rect::new(min_x.into(), min_y.into(), max_x.into(), max_y.into()))
+            Some(Rect::new(
+                min_x.into(),
+                min_y.into(),
+                max_x.into(),
+                max_y.into(),
+            ))
         } else {
             None
         }
@@ -251,7 +223,7 @@ impl Segmentor {
         let (embeddings) = self.encode_image(input_img_path).unwrap();
         let (predictions) = &embeddings.0;
         println!("predictions shape: {:?}", predictions.shape());
-        let mut data: Vec<Segment> =  Vec::new();
+        let mut data: Vec<Segment> = Vec::new();
         for (idx, row) in predictions.axis_iter(Axis(0)).enumerate() {
             let original_width = self.img_width as f32;
             let original_height = self.img_height as f32;
@@ -275,37 +247,35 @@ impl Segmentor {
                 let h = bbox[3] / ratio;
                 let x = cx - w / 2.;
                 let y = cy - h / 2.;
-                let bb_rect = Rect::new(x.into(), y.into(), x + w.into(), y + h.into());
-                let segment = Segment {
-                    bbox: bb_rect,
-                    geometry: MultiPolygon::from(Polygon::from(bb_rect)).into(),
-                    segment_type: self.class_labels.get(id).and_then(|label| {
-                        match label.as_str() {
-                            "building" => Some(SegmentLabel::Building),
-                            "road" => Some(SegmentLabel::Road),
-                            "swimming pool" => Some(SegmentLabel::SwimmingPool),
-                            "water" => Some(SegmentLabel::Water),
-                            "vegetation" => Some(SegmentLabel::Vegetation),
-                            "tennis court" => Some(SegmentLabel::TennisCourt),
-                            _ => None,
-                        }
-                    }),
-                    color: None,
+                /*
+                                let bb_rect = Rect::new(x.into(), y.into(), x + w.into(), y + h.into());
 
-                    confidence: Some(confidence),
-                    mask: Array::zeros((1, 1, 1024, 1024)).into_dyn(), // Placeholder for mask
-                                                                       //self
-                                                                       //    .generate_mask_for_point(cx, cy, original_width, original_height, &embeddings.0)
-                                                                       //    .await?,
-                }    
-                };
+                                let segment = Segment {
+                                    bbox: bb_rect,
+                                    geometry: MultiPolygon::from(Polygon::from(bb_rect)).into(),
+                                    segment_type: self.class_labels.get(id).and_then(|label| {
+                                        match label.as_str() {
+                                            "building" => Some(SegmentLabel::Building),
+                                            "road" => Some(SegmentLabel::Road),
+                                            "swimming pool" => Some(SegmentLabel::SwimmingPool),
+                                            "water" => Some(SegmentLabel::Water),
+                                            "vegetation" => Some(SegmentLabel::Vegetation),
+                                            "tennis court" => Some(SegmentLabel::TennisCourt),
+                                            _ => None,
+                                        }
+                                    }),
+                                    color: None,
 
-                data.push(segment);
+                                    confidence: Some(confidence),
+                                    mask: None, // Placeholder for mask
+                                };
+                                println!(
+                                    "Segment {}: {:?}, bbox: {:?}, class: {:?}, confidence: {:?}",
+                                    idx, segment.geometry, segment.bbox, segment.segment_type, confidence
+                                );
+                */
             }
-            println!("Segment {}: {:?}", idx, data);
-            
-        
-
+        }
 
         let mut output_img = RgbaImage::new(1024, 1024);
 
@@ -320,7 +290,6 @@ impl Segmentor {
         */
         Ok(output_img)
     }
-    
 
     //TODO
     async fn generate_segments(
@@ -346,15 +315,17 @@ impl Segmentor {
                 .unwrap();
 
             if let Some(bbox) = self.mask_to_bbox(&mask, resized_w, resized_h) {
-                let segment = Segment {
-                    geometry: bbox.into(),
-                    color: Color::random(),
-
-                    segment_type: None,
-                    confidence: None,
-                    mask: mask,
-                };
-                segments.push(segment);
+                /*
+                                let segment = Segment {
+                                    bbox,
+                                    geometry: MultiPolygon::from(Polygon::from(bbox)).into(),
+                                    segment_type: None, // Placeholder for segment type
+                                    color: None,        // Placeholder for color
+                                    confidence: None,   // Placeholder for confidence
+                                    mask: Some(SegmentMask::from(mask)),
+                                };
+                                segments.push(segment);
+                */
             }
         }
 
@@ -424,39 +395,6 @@ impl Segmentor {
         println!("embeddings: {:?}", embeddings);
         return Some((embeddings, img_h, img_w));
     }
-
-    fn draw_bounding_box(&self, image: &mut RgbaImage, bbox: BbCoords, color: Rgba<u8>) {
-        let (x1, y1, x2, y2) = (
-            bbox.x1 as u32,
-            bbox.y1 as u32,
-            bbox.x2 as u32,
-            bbox.y2 as u32,
-        );
-
-        // Draw horizontal lines
-        for x in x1..=x2 {
-            if x < image.width() {
-                if y1 < image.height() {
-                    image.put_pixel(x, y1, color);
-                }
-                if y2 < image.height() {
-                    image.put_pixel(x, y2, color);
-                }
-            }
-        }
-
-        // Draw vertical lines
-        for y in y1..=y2 {
-            if y < image.height() {
-                if x1 < image.width() {
-                    image.put_pixel(x1, y, color);
-                }
-                if x2 < image.width() {
-                    image.put_pixel(x2, y, color);
-                }
-            }
-        }
-    }
 }
 
 //use ort::Result;
@@ -478,7 +416,7 @@ pub async fn main() -> Result<()> {
         0.5,
     );
     let timestamp = chrono::Utc::now();
-    
+
     //TODO: Fix encoding error
     let output_img = segmentor
         .detect_obb(
@@ -487,8 +425,6 @@ pub async fn main() -> Result<()> {
         )
         .await?;
     output_img.save(format!("./output/{}output.png", timestamp))?;
-
-
 
     map_render::run();
     Ok(())
