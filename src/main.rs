@@ -6,7 +6,7 @@ use image::GenericImage;
 use image::GenericImageView;
 use image::imageops::FilterType;
 use image::{Pixel, Rgba, RgbaImage};
-use ndarray::{Array, ArrayBase, ArrayD, Axis, IxDyn};
+use ndarray::{Array, ArrayBase, ArrayD, ArrayView1, Axis, IxDyn};
 use ort::environment::Environment;
 use ort::session::Session;
 use ort::session::SessionOutputs;
@@ -213,6 +213,49 @@ impl Segmentor {
         }
     }
 
+    fn prediction_to_segment(
+        &self,
+        prediction: &Array<f32, IxDyn>,
+        scale_factor: f32,
+    ) -> Option<Segment> {
+        let bbox = prediction.slice(ndarray::s![0..4]);
+        let class_scores = prediction.slice(ndarray::s![4..4 + self.class_labels.len()]);
+        let (id, &confidence) = class_scores
+            .iter()
+            .enumerate()
+            .reduce(|max, x| if x.1 > max.1 { x } else { max })?;
+
+        if confidence < self.threshold {
+            return None;
+        }
+
+        let [cx, cy, w, h] = [bbox[0], bbox[1], bbox[2], bbox[3]];
+        let (x, y) = ((cx - w / 2.) * scale_factor, (cy - h / 2.) * scale_factor);
+        let (w, h) = (w * scale_factor, h * scale_factor);
+
+        let bbox_rect = Rect::new(x.into(), y.into(), (x + w).into(), (y + h).into());
+
+        let segment_type = self
+            .class_labels
+            .get(id)
+            .and_then(|label| match label.as_str() {
+                "building" => Some(SegmentLabel::Building),
+                "road" => Some(SegmentLabel::Road),
+                "swimming pool" => Some(SegmentLabel::SwimmingPool),
+                "water" => Some(SegmentLabel::Water),
+                "vegetation" => Some(SegmentLabel::Vegetation),
+                "tennis court" => Some(SegmentLabel::TennisCourt),
+                _ => None,
+            });
+        Some(Segment {
+            bbox: bbox_rect,
+            segment_type,
+            color: None,
+            confidence: Some(confidence),
+            mask: None, // Placeholder for mask
+        })
+    }
+
     async fn detect_obb(
         &mut self,
         input_img_path: &str,
@@ -222,66 +265,20 @@ impl Segmentor {
 
         let (embeddings) = self.encode_image(input_img_path).unwrap();
         let (predictions) = &embeddings.0;
+        let scale_factor = (1024. / self.img_width as f32).min(1024. / self.img_height as f32);
+
         println!("predictions shape: {:?}", predictions.shape());
-        let mut data: Vec<Segment> = Vec::new();
-        for (idx, row) in predictions.axis_iter(Axis(0)).enumerate() {
-            let original_width = self.img_width as f32;
-            let original_height = self.img_height as f32;
-            let ratio = (1024. / original_width).min(1024. / original_height);
-            for pred in row.axis_iter(Axis(1)) {
-                let bbox = pred.slice(ndarray::s![0..4]);
-
-                let class_scores = pred.slice(ndarray::s![4..4 + self.class_labels.len()]);
-                let (id, &confidence) = class_scores
-                    .iter()
-                    .enumerate()
-                    .reduce(|max, x| if x.1 > max.1 { x } else { max })
-                    .unwrap();
-
-                if confidence < self.threshold {
-                    continue;
-                }
-                let cx = bbox[0] / ratio;
-                let cy = bbox[1] / ratio;
-                let w = bbox[2] / ratio;
-                let h = bbox[3] / ratio;
-                let x = cx - w / 2.;
-                let y = cy - h / 2.;
-                /*
-                                let bb_rect = Rect::new(x.into(), y.into(), x + w.into(), y + h.into());
-
-                                let segment = Segment {
-                                    bbox: bb_rect,
-                                    geometry: MultiPolygon::from(Polygon::from(bb_rect)).into(),
-                                    segment_type: self.class_labels.get(id).and_then(|label| {
-                                        match label.as_str() {
-                                            "building" => Some(SegmentLabel::Building),
-                                            "road" => Some(SegmentLabel::Road),
-                                            "swimming pool" => Some(SegmentLabel::SwimmingPool),
-                                            "water" => Some(SegmentLabel::Water),
-                                            "vegetation" => Some(SegmentLabel::Vegetation),
-                                            "tennis court" => Some(SegmentLabel::TennisCourt),
-                                            _ => None,
-                                        }
-                                    }),
-                                    color: None,
-
-                                    confidence: Some(confidence),
-                                    mask: None, // Placeholder for mask
-                                };
-                                println!(
-                                    "Segment {}: {:?}, bbox: {:?}, class: {:?}, confidence: {:?}",
-                                    idx, segment.geometry, segment.bbox, segment.segment_type, confidence
-                                );
-                */
-            }
-        }
+        let segment_iter = predictions
+            .axis_iter(Axis(0))
+            //.flat_map(|batch| batch.axis_iter(Axis(1))).collect::<Vec<_>>()
+            .filter_map(|pred| self.prediction_to_segment(&pred.to_owned(), scale_factor));
+        let segments = segment_iter.collect::<Vec<_>>();
 
         let mut output_img = RgbaImage::new(1024, 1024);
 
         output_img.copy_from(&img, 0, 0).unwrap();
         output_img = self.letterbox(&output_img.into(), 1024, 1024).0.into();
-        self.create_mask_overlay(&mut output_img, &data);
+        self.create_mask_overlay(&mut output_img, &segments);
 
         /*
                self.create_mask_overlay(&mut output_img, &segments);
