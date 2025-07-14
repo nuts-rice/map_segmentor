@@ -98,17 +98,14 @@ pub fn run() {
         .expect("Failed to init map");
 }
 
-pub fn build_obb_layer() -> Arc<RwLock<RasterTileLayer>> {
-    unimplemented!()
-}
-
+/*
 pub fn overlay_segmented_layer(
     obb_img: &image::RgbaImage,
     segments: &[Segment],
 ) -> Arc<RwLock<FeatureLayer<Point2, Segment, SegmentMask, CartesianSpace2d>>> {
     unimplemented!()
 }
-
+*/
 pub fn download_sat_tile() -> Arc<RwLock<RasterTileLayer>> {
     let api_key = std::env::var("VT_API_KEY")
         .expect("Set MapTiler API key in VT_API_KEY environment variable");

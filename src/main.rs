@@ -253,6 +253,7 @@ impl Segmentor {
             color: None,
             confidence: Some(confidence),
             mask: None, // Placeholder for mask
+            is_hidden: false,
         })
     }
 
